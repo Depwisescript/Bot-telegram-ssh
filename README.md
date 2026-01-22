@@ -13,4 +13,4 @@ sudo systemctl restart tg-ssh-multi
 DESINTALAR 
 
 
-curl -L -o install.sh "https://raw.githubusercontent.com/Depwisescript/Bot-telegram-ssh/refs/heads/main/uninstall_tg_ssh_bot.sh" && chmod +x uninstall_tg_ssh_bot.sh && sudo ./uninstall_tg_ssh_bot.sh && rm uninstall_tg_ssh_bot.sh
+curl -L -o uninstall_tg_ssh_bot.sh "https://raw.githubusercontent.com/Depwisescript/Bot-telegram-ssh/refs/heads/main/uninstall_tg_ssh_bot.sh" && chmod +x uninstall_tg_ssh_bot.sh && sudo ./uninstall_tg_ssh_bot.sh && rm uninstall_tg_ssh_bot.sh
