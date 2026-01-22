@@ -5,3 +5,12 @@ curl -L -o install.sh "https://raw.githubusercontent.com/Depwisescript/Bot-teleg
 agregar cambiar bot token y id
 Edita nano /opt/tg-bot/.env
 sudo systemctl restart tg-ssh-multi
+
+
+
+
+
+DESINTALAR 
+
+
+curl -L -o install.sh "https://raw.githubusercontent.com/Depwisescript/Bot-telegram-ssh/refs/heads/main/uninstall_tg_ssh_bot.sh" && chmod +x install.sh && sudo ./uninstall_tg_ssh_bot.sh && rm uninstall_tg_ssh_bot.sh
