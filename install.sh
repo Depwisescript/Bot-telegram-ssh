@@ -43,7 +43,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-if [[ -z "${TELEGRAM_BOT_TOKEN}" || "${TELEGRAM_BOT_TOKEN}" == "PON_AQUI_TU_TOKEN" ]]; then
+if [[ -z "${TELEGRAM_BOT_TOKEN}" || "${TELEGRAM_BOT_TOKEN}" == "8209886235:AAFEygF89KrKYGx06gqY0MKYGpyQXwU8kHY" ]]; then
   echo "❌ Debes configurar TELEGRAM_BOT_TOKEN al inicio del script." >&2
   exit 1
 fi
