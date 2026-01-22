@@ -1,910 +1,517 @@
 #!/usr/bin/env bash
-# install_tg_ssh_bot_envfirst.sh
-# Instala/actualiza un bot de Telegram para administrar varios servidores vía SSH (Ubuntu 24.04)
-# Habilita por defecto /custom y modo shell, y permite agregar hosts desde Telegram.
-# *** Esta variante CARGA un .env existente ANTES de verificar el token/IDs ***
+# setup_ssh_tg_bot.sh - Instalador automático de un bot de Telegram que ejecuta comandos SSH
+# Probado en Ubuntu 24.04 LTS
+# Uso:
+#   sudo bash setup_ssh_tg_bot.sh
 
 set -euo pipefail
 
-########################
-# CONFIGURACIÓN RÁPIDA #
-########################
-
-# Valores por defecto (se pueden sobrescribir desde .env si ya existe)
-TELEGRAM_BOT_TOKEN="8209886235:AAFEygF89KrKYGx06gqY0MKYGpyQXwU8kHY"     # BotFather token (obligatorio si no hay .env)
-ALLOWED_USER_IDS="1594636958"               # IDs permitidos (coma-separados)
-BOT_USER="tg-bot"                          # usuario linux del bot
-BOT_HOME="/opt/tg-bot"
-HOSTS_FILE="${BOT_HOME}/hosts.yaml"
-ENV_FILE="${BOT_HOME}/.env"
-PY_SCRIPT="${BOT_HOME}/bot_ssh_multi.py"
-SERVICE_NAME="tg-ssh-multi"
-VENV_PATH="${BOT_HOME}/venv"
-SSH_DIR="${BOT_HOME}/.ssh"
-BOT_SSH_KEY="${SSH_DIR}/id_ed25519"
-
-# Opciones por defecto (puedes cambiarlas luego en .env)
-ALLOW_SHELL="true"        # habilitado por defecto ⚠️
-ALLOW_CUSTOM="true"       # habilitado por defecto ⚠️
-RATE_LIMIT="10"
-RATE_WINDOW_SEC="60"
-MAX_REPLY_CHARS="3500"
-
-# Seguridad SSH (por defecto más permisivo para usabilidad)
-# Si lo pones en "true", el bot sólo conectará a hosts cuya clave esté en known_hosts
-STRICT_HOST_KEY="false"   # true = verifica host keys (recomendado), false = auto-acepta
-
-###################################
-# CARGA .env ANTES DE VERIFICAR   #
-###################################
-
-# Si ya existe un despliegue anterior, intenta cargarlo para no exigir edición del script
-if [[ -f "${ENV_FILE}" ]]; then
-  echo "==> Cargando variables desde ${ENV_FILE}"
-  set -a
-  # shellcheck disable=SC1090
-  . "${ENV_FILE}"
-  set +a
-fi
-
-###################################
-# VERIFICACIONES Y PREPARATIVOS   #
-###################################
-
-if [[ $EUID -ne 0 ]]; then
-  echo "Este script debe ejecutarse como root (sudo)." >&2
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "[ERROR] Ejecuta como root: sudo bash setup_ssh_tg_bot.sh"
   exit 1
 fi
 
-# Validar token tras posible carga del .env
-if [[ -z "${TELEGRAM_BOT_TOKEN}" || "${TELEGRAM_BOT_TOKEN}" == "PON_AQUI_TU_TOKEN" ]]; then
-  echo "❌ Debes configurar TELEGRAM_BOT_TOKEN (en el script o en ${ENV_FILE})." >&2
-  exit 1
+# === Preguntas interactivas ===
+read -rp "Pega tu TELEGRAM_TOKEN (de BotFather): " TELEGRAM_TOKEN
+if [[ -z "${TELEGRAM_TOKEN}" ]]; then
+  echo "Token vacío. Abortando."; exit 1
 fi
 
-if [[ -z "${ALLOWED_USER_IDS}" || "${ALLOWED_USER_IDS}" == "123456789" ]]; then
-  echo "⚠️ AVISO: ALLOWED_USER_IDS no parece configurado con tu(s) ID(s) reales." >&2
-  echo "   Puedes continuar, pero el bot no funcionará para ti si no coincide." >&2
+read -rp "IDs de admins (separados por coma, ej: 12345,67890): " ADMIN_IDS
+if [[ -z "${ADMIN_IDS}" ]]; then
+  echo "Debes indicar al menos un ID de admin."; exit 1
 fi
 
-echo "==> Instalación/Actualización del bot en ${BOT_HOME} (usuario: ${BOT_USER})"
-
-#############################
-# PAQUETES Y USUARIO SISTEMA
-#############################
-
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends \
-  python3-venv python3-pip python3-dev gcc \
-  openssh-client ca-certificates
-
-# Crear usuario de sistema para el bot (si no existe)
-if ! id -u "${BOT_USER}" >/dev/null 2>&1; then
-  adduser --system --group --home "${BOT_HOME}" "${BOT_USER}"
-fi
-
-mkdir -p "${BOT_HOME}"
-chown -R "${BOT_USER}:${BOT_USER}" "${BOT_HOME}"
-chmod 0755 "${BOT_HOME}"
-
-########################################
-# MODO ACTUALIZACIÓN SEGURA (BACKUP)
-########################################
-
-BACKUP_DIR="${BOT_HOME}/.backup-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "${BACKUP_DIR}"
-
-# Si existe un despliegue previo, respáldalo
-if systemctl list-unit-files | grep -q "^${SERVICE_NAME}\.service"; then
-  echo "==> Detectado servicio previo. Parando para actualizar…"
-  systemctl stop "${SERVICE_NAME}" || true
-fi
-
-# Respaldos de archivos clave si existen
-for f in "${HOSTS_FILE}" "${ENV_FILE}" "${PY_SCRIPT}" \
-         "/etc/systemd/system/${SERVICE_NAME}.service"; do
-  if [[ -f "$f" ]]; then
-    cp -a "$f" "${BACKUP_DIR}/" || true
-  fi
-done
-if [[ -d "${SSH_DIR}" ]]; then
-  mkdir -p "${BACKUP_DIR}/.ssh"
-  cp -a "${SSH_DIR}"/* "${BACKUP_DIR}/.ssh/" 2>/dev/null || true
-fi
-
-##################################
-# ENTORNO PYTHON Y DEPENDENCIAS  #
-##################################
-
-sudo -u "${BOT_USER}" python3 -m venv "${VENV_PATH}"
-sudo -u "${BOT_USER}" "${VENV_PATH}/bin/pip" install --upgrade pip
-# Librerías necesarias
-sudo -u "${BOT_USER}" "${VENV_PATH}/bin/pip" install \
-  "python-telegram-bot==20.*" paramiko pyyaml
-
-#############################
-# CLAVES SSH DEL BOT (LOCAL)
-#############################
-
-sudo -u "${BOT_USER}" mkdir -p "${SSH_DIR}"
-chmod 0700 "${SSH_DIR}"
-if [[ ! -f "${BOT_SSH_KEY}" ]]; then
-  sudo -u "${BOT_USER}" ssh-keygen -t ed25519 -f "${BOT_SSH_KEY}" -N '' -C "${BOT_USER}@bot"
-fi
-chmod 0600 "${BOT_SSH_KEY}"
-
-PUBKEY_CONTENT="$(sudo -u "${BOT_USER}" cat "${BOT_SSH_KEY}.pub")"
-
-#############################
-# ARCHIVO hosts.yaml (si no existe, plantilla)
-#############################
-
-if [[ ! -f "${HOSTS_FILE}" ]]; then
-  sudo -u "${BOT_USER}" tee "${HOSTS_FILE}" >/dev/null <<'YAML'
-# hosts.yaml: Define alias, destino SSH y whitelist de comandos por servidor.
-# Puedes añadir/editar hosts desde Telegram con /addhost o /menu.
-
-# Ejemplos:
-
-prod1:
-  host: 10.0.0.10
-  port: 22
-  user: tgadmin
-  key_path: /opt/tg-bot/.ssh/id_ed25519
-  whitelist:
-    status: "uptime && who && uname -a"
-    disco: "df -h"
-    memoria: "free -h"
-
-# db:
-#   host: 10.0.0.20
-#   port: 22
-#   user: tgadmin
-#   key_path: /opt/tg-bot/.ssh/id_ed25519
-#   whitelist:
-#     status: "uptime && uname -a"
-YAML
-  chown "${BOT_USER}:${BOT_USER}" "${HOSTS_FILE}"
-  chmod 0600 "${HOSTS_FILE}"
-fi
-
-#############################
-# ARCHIVO .env (crea si no existe)
-#############################
-
-if [[ ! -f "${ENV_FILE}" ]]; then
-  sudo -u "${BOT_USER}" tee "${ENV_FILE}" >/dev/null <<ENV
-TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
-BOT_HOME=${BOT_HOME}
-HOSTS_FILE=${HOSTS_FILE}
-ALLOW_SHELL=${ALLOW_SHELL}
-ALLOW_CUSTOM=${ALLOW_CUSTOM}
-STRICT_HOST_KEY=${STRICT_HOST_KEY}
-RATE_LIMIT=${RATE_LIMIT}
-RATE_WINDOW_SEC=${RATE_WINDOW_SEC}
-MAX_REPLY_CHARS=${MAX_REPLY_CHARS}
-ENV
-  chown "${BOT_USER}:${BOT_USER}" "${ENV_FILE}"
-  chmod 0600 "${ENV_FILE}"
+read -rp "¿Habilitar verificación estricta de host key SSH? (y/N): " STRICT
+STRICT=${STRICT:-N}
+if [[ "${STRICT}" =~ ^[Yy]$ ]]; then
+  STRICT_HOST_KEY_CHECKING=true
 else
-  echo "==> Conservando configuración existente en ${ENV_FILE} (no sobrescrito)."
+  STRICT_HOST_KEY_CHECKING=false
 fi
 
-#############################
-# SCRIPT PRINCIPAL PYTHON
-#############################
+# === Paquetes del sistema ===
+export DEBIAN_FRONTEND=noninteractive
+apt update
+apt install -y python3 python3-venv python3-pip ufw \
+  build-essential python3-dev libffi-dev libssl-dev
 
-sudo -u "${BOT_USER}" tee "${PY_SCRIPT}" >/dev/null <<'PY'
+# Firewall básico
+ufw allow OpenSSH || true
+ufw --force enable || true
+
+# === Estructura de directorios ===
+APP_DIR=/opt/ssh-tg-bot
+KEYS_DIR="$APP_DIR/keys"
+TMP_DIR="$APP_DIR/tmp"
+mkdir -p "$APP_DIR" "$KEYS_DIR" "$TMP_DIR"
+
+# Usuario de sistema no-login
+id -u sshbot &>/dev/null || useradd -r -s /usr/sbin/nologin sshbot
+chown -R sshbot:sshbot "$APP_DIR"
+chmod 700 "$KEYS_DIR"
+chmod 700 "$TMP_DIR"
+
+# === Virtualenv y dependencias ===
+python3 -m venv "$APP_DIR/.venv"
+source "$APP_DIR/.venv/bin/activate"
+python -m pip install --upgrade pip
+
+# requirements.txt
+cat > "$APP_DIR/requirements.txt" << 'REQ'
+python-telegram-bot[rate-limiter]==21.*
+asyncssh>=2.14.0
+cryptography>=41.0.0
+python-dotenv>=1.0.0
+REQ
+
+pip install -r "$APP_DIR/requirements.txt"
+
+# === Bot (código Python) ===
+cat > "$APP_DIR/bot.py" << 'PY'
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+Bot de Telegram para ejecutar comandos SSH en servidores remotos.
+- Autenticación por lista de IDs de Telegram (admins) desde .env
+- Inventario de servidores administrados (JSON)
+- Credenciales:
+    * Claves privadas: subir con /uploadkey <nombre> como caption del documento
+    * Passwords: se guardan encriptados (Fernet) [no recomendado].
+- Comandos:
+    /start, /help
+    /servers                      -> lista servidores
+    /addserver <alias> <host> <port> <user> <auth:key|password> <cred>
+    /delserver <alias>
+    /uploadkey <nombre> (en caption del documento de la clave privada)
+    /setpass <alias> <password>   -> guarda password (encriptado)
+    /sh <alias> <cmd>             -> ejecuta comando puntual
 
+Seguridad:
+- Restringe a admins por ID.
+- Evita usar root; prefiere usuarios con sudo controlado.
+- known_hosts deshabilitado por defecto (para simplicidad). Actívalo con STRICT_HOST_KEY_CHECKING=true en .env y gestiona known_hosts manualmente.
+"""
+import os
+import json
 import asyncio
 import logging
-import os
-import html
-import yaml
-import subprocess
-from datetime import datetime, timedelta
-from collections import defaultdict, deque
-from typing import Dict, Any, Tuple
+import base64
+import tempfile
+from pathlib import Path
 
-import paramiko
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+import asyncssh
+from cryptography.fernet import Fernet
+from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters,
-    ConversationHandler, CallbackQueryHandler
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
+from dotenv import load_dotenv
 
-# ================== ENTORNO ==================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ALLOWED_USER_IDS = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()}
-BOT_HOME = os.getenv("BOT_HOME", "/opt/tg-bot")
-HOSTS_FILE = os.getenv("HOSTS_FILE", f"{BOT_HOME}/hosts.yaml")
-ALLOW_SHELL = os.getenv("ALLOW_SHELL", "false").lower() == "true"
-ALLOW_CUSTOM = os.getenv("ALLOW_CUSTOM", "false").lower() == "true"
-STRICT_HOST_KEY = os.getenv("STRICT_HOST_KEY", "false").lower() == "true"
-RATE_LIMIT = int(os.getenv("RATE_LIMIT", "10"))
-RATE_WINDOW_SEC = int(os.getenv("RATE_WINDOW_SEC", "60"))
-MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
-RATE_WINDOW = timedelta(seconds=RATE_WINDOW_SEC)
-
-BLOCKED_SUBSTR = [
-    " shutdown", "reboot", "halt", "poweroff", "init 0", ":(){:|:&};:",
-    " mkfs", " dd if=", " rm -rf /", "userdel ", " groupdel ", " visudo",
-    " --no-preserve-root"
-]
-
-DANGEROUS_TOKENS = [';', '&&', '||', '|', '`', '$(', ')', '>', '<', '*', '{', '}', '&', '\n']
-
-hosts: Dict[str, Dict[str, Any]] = {}
-rate_buckets = defaultdict(lambda: deque())
-shell_sessions: Dict[int, Dict[str, Any]] = {}  # chat_id -> session dict
-
+# === Logging ===
 logging.basicConfig(
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("tg-ssh-multi")
+logger = logging.getLogger('ssh-tg-bot')
 
-# ================== UTILIDADES ==================
+# === Carga .env ===
+load_dotenv()
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+ADMIN_IDS = {
+    int(x.strip()) for x in os.getenv('ADMIN_USER_IDS', '').split(',') if x.strip().isdigit()
+}
+DATA_DIR = Path(os.getenv('DATA_DIR', '/opt/ssh-tg-bot'))
+KEYS_DIR = Path(os.getenv('KEYS_DIR', str(DATA_DIR / 'keys')))
+TMP_DIR = Path(os.getenv('TMP_DIR', str(DATA_DIR / 'tmp')))
+INVENTORY_FILE = DATA_DIR / 'inventory.json'
+ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
+STRICT_HOST_KEY_CHECKING = os.getenv('STRICT_HOST_KEY_CHECKING', 'false').lower() == 'true'
+KNOWN_HOSTS_FILE = DATA_DIR / 'known_hosts'
 
-def is_authorized(update: Update) -> bool:
+if not TOKEN:
+    raise SystemExit('Falta TELEGRAM_TOKEN en .env')
+if not ADMIN_IDS:
+    raise SystemExit('Falta ADMIN_USER_IDS en .env')
+
+# === Cifrado para passwords ===
+if not ENCRYPTION_KEY:
+    raise SystemExit('Falta ENCRYPTION_KEY en .env')
+try:
+    fernet = Fernet(ENCRYPTION_KEY.encode())
+except Exception as e:
+    raise SystemExit(f'ENCRYPTION_KEY inválida: {e}')
+
+# === Estructuras ===
+INV_LOCK = asyncio.Lock()
+
+def load_inventory():
+    if not INVENTORY_FILE.exists():
+        return {"servers": {}}
+    try:
+        with INVENTORY_FILE.open('r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        logger.exception('No se pudo leer inventory.json; usando estructura vacía')
+        return {"servers": {}}
+
+async def save_inventory(inv: dict):
+    tmp = INVENTORY_FILE.with_suffix('.tmp')
+    with tmp.open('w', encoding='utf-8') as f:
+        json.dump(inv, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, INVENTORY_FILE)
+
+# === Helpers ===
+
+def is_admin(update: Update) -> bool:
     user = update.effective_user
-    chat = update.effective_chat
-    return bool(user and chat and chat.type == "private" and user.id in ALLOWED_USER_IDS)
+    return bool(user and user.id in ADMIN_IDS)
 
-def check_rate_limit(user_id: int) -> bool:
-    dq = rate_buckets[user_id]
-    now = datetime.utcnow()
-    while dq and now - dq[0] > RATE_WINDOW:
-        dq.popleft()
-    if len(dq) >= RATE_LIMIT:
+async def ensure_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not is_admin(update):
+        await update.effective_chat.send_message('⛔️ No autorizado.')
         return False
-    dq.append(now)
     return True
 
-def load_hosts() -> None:
-    global hosts
-    if not os.path.exists(HOSTS_FILE):
-        raise RuntimeError(f"No existe {HOSTS_FILE}")
-    with open(HOSTS_FILE, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    norm = {}
-    for alias, cfg in data.items():
-        if not isinstance(cfg, dict):
-            continue
-        alias_l = str(alias).strip().lower()
-        norm[alias_l] = {
-            "host": cfg.get("host"),
-            "port": int(cfg.get("port", 22)),
-            "user": cfg.get("user", "tgadmin"),
-            "key_path": cfg.get("key_path", f"{BOT_HOME}/.ssh/id_ed25519"),
-            "whitelist": cfg.get("whitelist", {}) or {}
-        }
-    hosts = norm
-    logger.info("Cargados %d hosts desde %s", len(hosts), HOSTS_FILE)
-
-def save_hosts() -> None:
-    # Escritura atómica con permisos seguros
-    tmp_path = HOSTS_FILE + ".tmp"
-    with open(HOSTS_FILE, "r", encoding="utf-8") as f:
-        current = yaml.safe_load(f) or {}
-    # Reconstruye con el mismo contenido normalizado de 'hosts'
-    out = {}
-    for alias, cfg in hosts.items():
-        out[alias] = {
-            "host": cfg.get("host"),
-            "port": int(cfg.get("port", 22)),
-            "user": cfg.get("user", "tgadmin"),
-            "key_path": cfg.get("key_path", f"{BOT_HOME}/.ssh/id_ed25519"),
-            "whitelist": cfg.get("whitelist", {}) or {}
-        }
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(out, f, allow_unicode=True, sort_keys=True)
-    os.replace(tmp_path, HOSTS_FILE)
-    try:
-        os.chmod(HOSTS_FILE, 0o600)
-    except Exception:
-        pass
-
-
-def get_host_cfg(alias: str) -> Dict[str, Any]:
-    a = alias.strip().lower()
-    if a not in hosts:
-        raise KeyError(f"Alias no encontrado: {alias}")
-    cfg = hosts[a]
-    for k in ("host", "port", "user", "key_path"):
-        if not cfg.get(k):
-            raise RuntimeError(f"Configuración incompleta para {alias}: falta '{k}'")
-    return cfg
-
-
-def get_ssh_client_for(alias: str) -> paramiko.SSHClient:
-    cfg = get_host_cfg(alias)
-    key_path = cfg["key_path"]
-    pkey = None
-    last_ex = None
-    for loader in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
-        try:
-            pkey = loader.from_private_key_file(key_path)
-            break
-        except Exception as e:
-            last_ex = e
-    if pkey is None:
-        raise RuntimeError(f"No se pudo cargar la clave {key_path}: {last_ex}")
-    cli = paramiko.SSHClient()
-    if STRICT_HOST_KEY:
-        # Verificación estricta de host keys usando known_hosts del bot
-        kh_path = os.path.join(BOT_HOME, ".ssh", "known_hosts")
-        if os.path.exists(kh_path):
-            cli.load_host_keys(kh_path)
-        cli.set_missing_host_key_policy(paramiko.RejectPolicy())
-    else:
-        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    cli.connect(
-        hostname=cfg["host"], port=cfg["port"], username=cfg["user"],
-        pkey=pkey, look_for_keys=False, allow_agent=False,
-        timeout=10, banner_timeout=10, auth_timeout=10
-    )
-    return cli
-
-
-def run_cmd_ssh(alias: str, command: str, timeout: int = 25) -> Tuple[str, str, int]:
-    cli = None
-    try:
-        cli = get_ssh_client_for(alias)
-        stdin, stdout, stderr = cli.exec_command(command, timeout=timeout, get_pty=True)
-        out = stdout.read().decode(errors="replace")
-        err = stderr.read().decode(errors="replace")
-        code = stdout.channel.recv_exit_status()
-        return out, err, code
-    finally:
-        try:
-            if cli: cli.close()
-        except Exception:
-            pass
-
-
-async def reply_pre(update: Update, text: str):
-    if len(text) > MAX_REPLY_CHARS:
-        text = "…(truncado)…\n" + text[-MAX_REPLY_CHARS:]
-    esc = html.escape(text)
-    await update.effective_message.reply_text(f"<pre>{esc}</pre>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-async def reply_html(update: Update, html_text: str):
-    await update.effective_message.reply_text(html_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-async def reply_text(update: Update, text: str):
-    await update.effective_message.reply_text(text, disable_web_page_preview=True)
-
-
-def contains_blocked(cmd: str) -> bool:
-    c = f" {cmd.strip()} ".lower()
-    if any(tok in cmd for tok in DANGEROUS_TOKENS):
-        return True
-    return any(b in c for b in BLOCKED_SUBSTR)
-
-# ================== COMANDOS ==================
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+    if not await ensure_admin(update, context):
         return
     text = (
-        "🤖 <b>Bot SSH multi-servidor</b>\n\n"
-        "• /hosts — listar servidores\n"
-        "• /run &lt;alias&gt; &lt;nombre&gt; — ejecutar un comando permitido\n"
-        f"• /custom &lt;alias&gt; &lt;cmd&gt; — {'(habilitado ⚠️)' if ALLOW_CUSTOM else '(deshabilitado)'}\n"
-        "• /reload — recargar hosts.yaml\n"
-        "• /addhost — asistente para agregar un host\n"
-        "• /trust &lt;alias&gt; — registrar host key en known_hosts (si STRICT_HOST_KEY=true)\n\n"
-        f"<b>Modo consola</b> {'(habilitado ⚠️)' if ALLOW_SHELL else '(deshabilitado)'}\n"
-        "• /connect &lt;alias&gt; — abrir sesión\n"
-        "• /sh &lt;cmd&gt; — ejecutar comando\n"
-        "• /close — cerrar sesión\n\n"
-        "• /menu — abrir menú\n"
-        "⚠️ Recomendado: usar whitelist y evitar secretos por Telegram."
+        '🤖 *SSH Bot listo*\n\n'
+        'Usa /help para ver comandos.\n\n'
+        '*Aviso de seguridad:*\n'
+        '• Evita usar *root* directamente; usa usuarios con *sudo* limitado.\n'
+        '• Las *contraseñas* se guardan encriptadas, pero es mejor usar *claves*.\n'
+        '• Host key checking está *desactivado* por defecto; actívalo en *.env*.\n'
     )
-    await reply_html(update, text)
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_hosts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_admin(update, context):
         return
-    rows = []
-    for alias, cfg in hosts.items():
-        wl = cfg.get("whitelist", {})
-        rows.append(f"- {alias}: {cfg.get('host')}:{cfg.get('port')} (user={cfg.get('user')}) | whitelist={len(wl)} cmds")
-    await reply_pre(update, "\n".join(rows) if rows else "No hay hosts configurados.")
+    text = (
+        '*Comandos disponibles*\n'
+        '/servers - Lista servidores\n'
+        '/addserver <alias> <host> <port> <user> <auth:key|password> <cred>\n'
+        '   - Si auth=key, <cred>=nombre_de_clave (de /uploadkey)\n'
+        '   - Si auth=password, usa luego /setpass <alias> <password>\n'
+        '/delserver <alias> - Elimina servidor\n'
+        '/uploadkey <nombre> (como caption del *documento* con la clave privada)\n'
+        '/setpass <alias> <password> - (⚠️ Riesgoso) Guarda password (cifrado)\n'
+        '/sh <alias> <comando> - Ejecuta un comando puntual\n'
+    )
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+async def cmd_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_admin(update, context):
         return
+    async with INV_LOCK:
+        inv = load_inventory()
+    if not inv['servers']:
+        await update.effective_chat.send_message('No hay servidores registrados. Usa /addserver')
+        return
+    lines = ['*Servidores:*']
+    for alias, s in inv['servers'].items():
+        auth = s.get('auth')
+        detail = s.get('key_name') if auth == 'key' else ('password✔️' if s.get('password') else 'password❌')
+        lines.append(f"- `{alias}` → {s.get('user')}@{s.get('host')}:{s.get('port')}  auth={auth}({detail})")
+    await update.effective_chat.send_message('\n'.join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_addserver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_admin(update, context):
+        return
+    args = context.args
+    if len(args) != 6:
+        await update.effective_chat.send_message(
+            'Uso: /addserver <alias> <host> <port> <user> <auth:key|password> <cred>\n'
+            'Ej.: /addserver web1 10.0.0.10 22 ubuntu key id_rsa_web1')
+        return
+    alias, host, port, user, auth, cred = args
     try:
-        load_hosts()
-        await reply_text(update, "✅ hosts.yaml recargado.")
-    except Exception as e:
-        await reply_text(update, f"❌ Error recargando: {e}")
+        port = int(port)
+        assert 1 <= port <= 65535
+    except Exception:
+        await update.effective_chat.send_message('Port inválido')
+        return
+    if auth not in ('key', 'password'):
+        await update.effective_chat.send_message('auth debe ser key o password')
+        return
 
-async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    user_id = update.effective_user.id
-    if not check_rate_limit(user_id):
-        await reply_text(update, "⏳ Demasiadas solicitudes.")
-        return
-    if len(context.args) < 2:
-        await reply_text(update, "Uso: /run <alias> <nombre_whitelist>")
-        return
-    alias = context.args[0].strip().lower()
-    name = context.args[1].strip().lower()
-    try:
-        cfg = get_host_cfg(alias)
-        wl = cfg.get("whitelist", {})
-        if name not in wl:
-            await reply_text(update, f"❌ No permitido en '{alias}': {name}")
+    async with INV_LOCK:
+        inv = load_inventory()
+        if alias in inv['servers']:
+            await update.effective_chat.send_message('Alias ya existe.')
             return
-        command = wl[name]
-        await reply_text(update, f"▶️ {alias}$ {name} …")
-        out, err, code = await asyncio.to_thread(run_cmd_ssh, alias, command)
-        msg = out.strip() or "(sin salida)"
-        if err.strip():
-            msg += f"\n--- STDERR ---\n{err.strip()}"
-        msg += f"\n\n[exit={code}]"
-        await reply_pre(update, msg)
-    except Exception as e:
-        await reply_text(update, f"❌ Error: {e}")
+        entry = {"host": host, "port": port, "user": user, "auth": auth}
+        if auth == 'key':
+            entry['key_name'] = cred
+        else:
+            # password se establece con /setpass
+            entry['password'] = None
+        inv['servers'][alias] = entry
+        await save_inventory(inv)
+    await update.effective_chat.send_message(f'Servidor `{alias}` agregado.', parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+async def cmd_delserver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_admin(update, context):
         return
-    if not ALLOW_CUSTOM:
-        await reply_text(update, "🚫 /custom deshabilitado.")
+    if len(context.args) != 1:
+        await update.effective_chat.send_message('Uso: /delserver <alias>')
         return
-    user_id = update.effective_user.id
-    if not check_rate_limit(user_id):
-        await reply_text(update, "⏳ Demasiadas solicitudes.")
+    alias = context.args[0]
+    async with INV_LOCK:
+        inv = load_inventory()
+        if alias not in inv['servers']:
+            await update.effective_chat.send_message('Alias no encontrado')
+            return
+        del inv['servers'][alias]
+        await save_inventory(inv)
+    await update.effective_chat.send_message(f'Servidor `{alias}` eliminado.', parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_setpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_admin(update, context):
         return
     if len(context.args) < 2:
-        await reply_text(update, "Uso: /custom <alias> <comando>")
+        await update.effective_chat.send_message('Uso: /setpass <alias> <password>')
         return
-    alias = context.args[0].strip().lower()
-    command = " ".join(context.args[1:])
-    if contains_blocked(command):
-        await reply_text(update, "🚫 Comando bloqueado por seguridad.")
-        return
-    try:
-        await reply_text(update, f"▶️ {alias}$ {html.escape(command)}")
-        out, err, code = await asyncio.to_thread(run_cmd_ssh, alias, command)
-        msg = out.strip() or "(sin salida)"
-        if err.strip():
-            msg += f"\n--- STDERR ---\n{err.strip()}"
-        msg += f"\n\n[exit={code}]"
-        await reply_pre(update, msg)
-    except Exception as e:
-        await reply_text(update, f"❌ Error: {e}")
+    alias = context.args[0]
+    password = ' '.join(context.args[1:])
+    async with INV_LOCK:
+        inv = load_inventory()
+        s = inv['servers'].get(alias)
+        if not s:
+            await update.effective_chat.send_message('Alias no encontrado')
+            return
+        token = fernet.encrypt(password.encode()).decode()
+        s['password'] = token
+        s['auth'] = 'password'
+        await save_inventory(inv)
+    await update.effective_chat.send_message('Password guardado (cifrado). ⚠️ Considera usar claves en su lugar.')
 
-async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_admin(update, context):
         return
-    if not ALLOW_SHELL:
-        await reply_text(update, "🚫 Modo consola deshabilitado.")
+    doc = update.message.document
+    if not doc:
         return
-    if not context.args:
-        await reply_text(update, "Uso: /connect <alias>")
+    caption = (doc.caption or '').strip()
+    if not caption.startswith('/uploadkey'):
+        await update.effective_chat.send_message('Para subir una clave usa el caption: /uploadkey <nombre>')
         return
-    alias = context.args[0].strip().lower()
-    chat_id = update.effective_chat.id
-    if chat_id in shell_sessions:
-        await reply_text(update, f"Ya hay una sesión abierta ({shell_sessions[chat_id]['alias']}). Usa /close.")
+    parts = caption.split(maxsplit=1)
+    if len(parts) != 2:
+        await update.effective_chat.send_message('Uso: /uploadkey <nombre> (en caption)')
         return
+    key_name = parts[1].strip()
+    if not key_name:
+        await update.effective_chat.send_message('Nombre de clave inválido')
+        return
+
+    file = await context.bot.get_file(doc.file_id)
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = KEYS_DIR / key_name
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        await file.download_to_drive(custom_path=tmp.name)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(dest)
+    os.chown(dest, os.getuid(), os.getgid())
+    os.chmod(dest, 0o600)
+    await update.effective_chat.send_message(f'Clave guardada como `{key_name}`', parse_mode=ParseMode.MARKDOWN)
+
+async def run_ssh_command(server: dict, command: str, timeout: int = 60):
+    host = server['host']
+    port = server['port']
+    user = server['user']
+    auth = server['auth']
+
+    client_keys = None
+    password = None
+
+    if auth == 'key':
+        key_name = server.get('key_name')
+        key_path = KEYS_DIR / key_name
+        if not key_path.exists():
+            return 1, '', f'Clave no encontrada: {key_path}'
+        client_keys = [str(key_path)]
+    else:
+        token = server.get('password')
+        if not token:
+            return 1, '', 'No hay password configurado. Usa /setpass.'
+        try:
+            password = fernet.decrypt(token.encode()).decode()
+        except Exception:
+            return 1, '', 'No se pudo descifrar el password.'
+
+    known_hosts = None
+    if STRICT_HOST_KEY_CHECKING:
+        known_hosts = str(KNOWN_HOSTS_FILE)
+
     try:
-        client = get_ssh_client_for(alias)
-        chan = client.invoke_shell(term="xterm", width=120, height=32)
-        chan.settimeout(1.0)
-        await asyncio.sleep(0.5)
-        _ = chan.recv(1024) if chan.recv_ready() else b""
-        shell_sessions[chat_id] = {"alias": alias, "client": client, "chan": chan, "last": datetime.utcnow()}
-        await reply_html(update, f"✅ Sesión abierta en <b>{html.escape(alias)}</b>. Usa /sh &lt;cmd&gt;.")
+        async with asyncssh.connect(
+            host=host,
+            port=port,
+            username=user,
+            client_keys=client_keys,
+            password=password,
+            known_hosts=known_hosts,
+        ) as conn:
+            # Ejecutar bajo bash -lc para permitir expansión, PATH, etc.
+            result = await asyncio.wait_for(
+                conn.run(f"bash -lc {json.dumps(command)}", check=False),
+                timeout=timeout,
+            )
+            stdout = result.stdout or ''
+            stderr = result.stderr or ''
+            return result.exit_status, stdout, stderr
+    except asyncio.TimeoutError:
+        return 124, '', 'Tiempo de espera agotado.'
     except Exception as e:
-        await reply_text(update, f"❌ No se pudo abrir la sesión: {e}")
+        logger.exception('Fallo SSH')
+        return 255, '', f'Error SSH: {e}'
 
 async def cmd_sh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+    if not await ensure_admin(update, context):
         return
-    if not ALLOW_SHELL:
-        await reply_text(update, "🚫 Modo consola deshabilitado.")
+    if len(context.args) < 2:
+        await update.effective_chat.send_message('Uso: /sh <alias> <comando>')
         return
-    chat_id = update.effective_chat.id
-    sess = shell_sessions.get(chat_id)
-    if not sess:
-        await reply_text(update, "No hay sesión abierta. Usa /connect <alias>.")
-        return
-    if not context.args:
-        await reply_text(update, "Uso: /sh <comando>")
-        return
-    cmd = " ".join(context.args)
-    if contains_blocked(cmd):
-        await reply_text(update, "🚫 Comando bloqueado por seguridad.")
-        return
-    try:
-        chan = sess["chan"]
-        chan.send(cmd + "\n")
-        output = []
-        for _ in range(16):
-            await asyncio.sleep(0.6)
-            if chan.recv_ready():
-                output.append(chan.recv(4096).decode(errors="replace"))
-            else:
-                break
-        text = "".join(output).strip() or "(sin salida)"
-        sess["last"] = datetime.utcnow()
-        await reply_pre(update, text)
-    except Exception as e:
-        await reply_text(update, f"❌ Error ejecutando: {e}")
+    alias = context.args[0]
+    command = ' '.join(context.args[1:])
 
-async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+    async with INV_LOCK:
+        inv = load_inventory()
+        server = inv['servers'].get(alias)
+    if not server:
+        await update.effective_chat.send_message('Alias no encontrado')
         return
-    chat_id = update.effective_chat.id
-    sess = shell_sessions.pop(chat_id, None)
-    try:
-        if sess:
-            try: sess["chan"].close()
-            except Exception: pass
-            try: sess["client"].close()
-            except Exception: pass
-        await reply_text(update, "🔒 Sesión cerrada.")
-    except Exception:
-        await reply_text(update, "Sesión cerrada.")
 
-# ====== TRUST HOST KEY ======
-async def cmd_trust(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    if not context.args:
-        return await reply_text(update, "Uso: /trust <alias>")
-    alias = context.args[0].strip().lower()
-    try:
-        cfg = get_host_cfg(alias)
-        host = cfg['host']
-        port = int(cfg.get('port', 22))
-        kh_dir = os.path.join(BOT_HOME, ".ssh")
-        os.makedirs(kh_dir, exist_ok=True)
-        kh_path = os.path.join(kh_dir, "known_hosts")
-        cmd = ["ssh-keyscan", "-p", str(port), host]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if res.returncode != 0 or not res.stdout.strip():
-            return await reply_text(update, f"❌ ssh-keyscan falló para {host}:{port}: {res.stderr.strip()}")
-        with open(kh_path, "a", encoding="utf-8") as f:
-            f.write(res.stdout)
+    await update.effective_chat.send_message(f'Ejecutando en `{alias}`: \n```\n{command}\n```', parse_mode=ParseMode.MARKDOWN)
+    code, out, err = await run_ssh_command(server, command)
+
+    text = f"*Exit:* {code}\n"
+    if out:
+        text += f"\n*STDOUT:*\n```
+{out[:3500]}
+```\n"
+    if err:
+        text += f"\n*STDERR:*\n```
+{err[:3500]}
+```"
+
+    # Si el output es muy grande, enviarlo como archivo
+    if (out and len(out) > 3500) or (err and len(err) > 3500):
+        # Guardar a archivo temporal y adjuntar
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_file = TMP_DIR / f"out_{alias}_{int(asyncio.get_event_loop().time())}.txt"
+        with tmp_file.open('w', encoding='utf-8') as f:
+            if out:
+                f.write('--- STDOUT ---\n')
+                f.write(out)
+                f.write('\n')
+            if err:
+                f.write('--- STDERR ---\n')
+                f.write(err)
+                f.write('\n')
         try:
-            os.chmod(kh_path, 0o644)
+            await update.effective_chat.send_document(InputFile(str(tmp_file), filename=tmp_file.name))
         except Exception:
-            pass
-        await reply_text(update, f"✅ Host key agregada a known_hosts para {alias} ({host}:{port}).")
-    except Exception as e:
-        await reply_text(update, f"❌ Error: {e}")
+            logger.exception('No se pudo enviar el archivo de salida')
 
-# ====== MENÚ E INTERFAZ PARA AGREGAR HOST ======
-AH_ALIAS, AH_HOST, AH_PORT, AH_USER, AH_KEY_PATH, AH_CONFIRM = range(6)
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.MARKDOWN)
 
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    kb = [
-        [InlineKeyboardButton("➕ Añadir host", callback_data="menu_addhost")],
-        [InlineKeyboardButton("📋 Hosts", callback_data="menu_hosts"), InlineKeyboardButton("🔄 Recargar", callback_data="menu_reload")]
-    ]
-    await update.effective_message.reply_text(
-        "Elige una opción:", reply_markup=InlineKeyboardMarkup(kb)
-    )
 
-async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    q = update.callback_query
-    await q.answer()
-    if q.data == "menu_addhost":
-        # inicia asistente
-        return await addhost_start(update, context, via_callback=True)
-    elif q.data == "menu_hosts":
-        # muestra hosts
-        rows = []
-        for alias, cfg in hosts.items():
-            wl = cfg.get("whitelist", {})
-            rows.append(f"- {alias}: {cfg.get('host')}:{cfg.get('port')} (user={cfg.get('user')}) | whitelist={len(wl)} cmds")
-        return await q.edit_message_text("No hay hosts configurados." if not rows else "\n".join(rows))
-    elif q.data == "menu_reload":
-        try:
-            load_hosts()
-            return await q.edit_message_text("✅ hosts.yaml recargado.")
-        except Exception as e:
-            return await q.edit_message_text(f"❌ Error recargando: {e}")
+def build_app() -> Application:
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler('start', cmd_start))
+    app.add_handler(CommandHandler('help', cmd_help))
+    app.add_handler(CommandHandler('servers', cmd_servers))
+    app.add_handler(CommandHandler('addserver', cmd_addserver))
+    app.add_handler(CommandHandler('delserver', cmd_delserver))
+    app.add_handler(CommandHandler('setpass', cmd_setpass))
+    app.add_handler(CommandHandler('sh', cmd_sh))
 
-async def addhost_start(update: Update, context: ContextTypes.DEFAULT_TYPE, via_callback: bool=False):
-    if not is_authorized(update):
-        return ConversationHandler.END
-    context.user_data.clear()
-    msg = "Vamos a agregar un host.\nIngresa <b>alias</b> (sin espacios):"
-    if via_callback:
-        await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.HTML)
-    else:
-        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
-    return AH_ALIAS
-
-async def ah_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    alias = update.effective_message.text.strip().lower()
-    if not alias or ' ' in alias or ':' in alias:
-        await reply_text(update, "Alias inválido. Intenta de nuevo (sin espacios).")
-        return AH_ALIAS
-    context.user_data['alias'] = alias
-    await reply_text(update, "Ingresa <b>host</b> o IP:")
-    return AH_HOST
-
-async def ah_host(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    host = update.effective_message.text.strip()
-    if not host:
-        await reply_text(update, "Host inválido. Intenta de nuevo.")
-        return AH_HOST
-    context.user_data['host'] = host
-    await reply_text(update, "Ingresa <b>puerto</b> (por defecto 22):")
-    return AH_PORT
-
-async def ah_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.effective_message.text.strip()
-    if not txt:
-        port = 22
-    else:
-        if not txt.isdigit():
-            await reply_text(update, "Debe ser numérico. Escribe el puerto (ej. 22).")
-            return AH_PORT
-        port = int(txt)
-        if not (1 <= port <= 65535):
-            await reply_text(update, "Puerto fuera de rango. Intenta de nuevo.")
-            return AH_PORT
-    context.user_data['port'] = port
-    await reply_text(update, "Ingresa <b>usuario</b> SSH (por defecto tgadmin):")
-    return AH_USER
-
-async def ah_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_message.text.strip() or 'tgadmin'
-    context.user_data['user'] = user
-    default_key = f"{BOT_HOME}/.ssh/id_ed25519"
-    await reply_text(update, f"Ruta de clave privada (por defecto {default_key}):")
-    return AH_KEY_PATH
-
-async def ah_key_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key_path = update.effective_message.text.strip() or f"{BOT_HOME}/.ssh/id_ed25519"
-    context.user_data['key_path'] = key_path
-    alias = context.user_data['alias']
-    host = context.user_data['host']
-    port = context.user_data['port']
-    user = context.user_data['user']
-    text = (
-        "<b>Confirmar nuevo host</b>\n"
-        f"alias: <code>{html.escape(alias)}</code>\n"
-        f"host: <code>{html.escape(host)}</code>\n"
-        f"port: <code>{port}</code>\n"
-        f"user: <code>{html.escape(user)}</code>\n"
-        f"key: <code>{html.escape(key_path)}</code>\n\n"
-        "Se creará una whitelist base (status, disco, memoria). ¿Confirmas?"
-    )
-    kb = [[InlineKeyboardButton("✅ Confirmar", callback_data="ah_ok"), InlineKeyboardButton("❌ Cancelar", callback_data="ah_cancel")]]
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-    return AH_CONFIRM
-
-async def ah_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return ConversationHandler.END
-    q = update.callback_query
-    await q.answer()
-    if q.data == 'ah_cancel':
-        await q.edit_message_text("Operación cancelada.")
-        return ConversationHandler.END
-    data = context.user_data
-    alias = data['alias']
-    hosts[alias] = {
-        'host': data['host'],
-        'port': data['port'],
-        'user': data['user'],
-        'key_path': data['key_path'],
-        'whitelist': {
-            'status': 'uptime && uname -a',
-            'disco': 'df -h',
-            'memoria': 'free -h'
-        }
-    }
-    try:
-        save_hosts()
-        load_hosts()
-        await q.edit_message_text(f"✅ Host '{alias}' agregado. Usa /reload si es necesario.")
-    except Exception as e:
-        await q.edit_message_text(f"❌ Error guardando: {e}")
-    return ConversationHandler.END
-
-async def ah_cancel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_text(update, "Operación cancelada.")
-    return ConversationHandler.END
-
-# Fallback genérico
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_authorized(update):
-        await reply_text(update, "Usa /menu, /hosts, /run, /custom, /connect, /close, /help.")
-
-# Limpieza periódica de sesiones inactivas
-IDLE_MAX = 180  # segundos
-async def idle_cleaner(app: Application):
-    while True:
-        try:
-            for chat_id, sess in list(shell_sessions.items()):
-                if (datetime.utcnow() - sess['last']).total_seconds() > IDLE_MAX:
-                    try:
-                        sess['chan'].close()
-                        sess['client'].close()
-                    except Exception:
-                        pass
-                    shell_sessions.pop(chat_id, None)
-        except Exception:
-            pass
-        await asyncio.sleep(30)
-
-async def post_init(app: Application):
-    cmds = [
-        BotCommand("start", "Ayuda y comandos"),
-        BotCommand("menu", "Abrir menú"),
-        BotCommand("hosts", "Listar hosts"),
-        BotCommand("addhost", "Asistente para agregar host"),
-        BotCommand("reload", "Recargar hosts.yaml"),
-        BotCommand("run", "Ejecutar comando whitelisted"),
-        BotCommand("custom", "Ejecutar comando libre (⚠️)"),
-        BotCommand("connect", "Abrir sesión de shell (⚠️)"),
-        BotCommand("sh", "Ejecutar en sesión abierta (⚠️)"),
-        BotCommand("close", "Cerrar sesión"),
-        BotCommand("trust", "Registrar host key en known_hosts")
-    ]
-    await app.bot.set_my_commands(cmds)
+    # Documentos (para /uploadkey con caption)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    return app
 
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
-    if not ALLOWED_USER_IDS:
-        raise RuntimeError("Configura ALLOWED_USER_IDS con tus IDs (numéricos).")
-    load_hosts()
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    app = build_app()
+    logger.info('Iniciando bot (long polling)...')
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    # Comandos principales
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu_"))
 
-    app.add_handler(CommandHandler("hosts", cmd_hosts))
-    app.add_handler(CommandHandler("reload", cmd_reload))
-    app.add_handler(CommandHandler("run", cmd_run))
-    app.add_handler(CommandHandler("custom", cmd_custom))
-
-    app.add_handler(CommandHandler("connect", cmd_connect))
-    app.add_handler(CommandHandler("sh", cmd_sh))
-    app.add_handler(CommandHandler("close", cmd_close))
-    app.add_handler(CommandHandler("trust", cmd_trust))
-
-    # Conversación para /addhost
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("addhost", addhost_start)],
-        states={
-            AH_ALIAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ah_alias)],
-            AH_HOST: [MessageHandler(filters.TEXT & ~filters.COMMAND, ah_host)],
-            AH_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ah_port)],
-            AH_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ah_user)],
-            AH_KEY_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, ah_key_path)],
-            AH_CONFIRM: [CallbackQueryHandler(ah_confirm_cb, pattern=r"^ah_(ok|cancel)$")],
-        },
-        fallbacks=[CommandHandler("cancel", ah_cancel_text)],
-        name="addhost",
-        persistent=False,
-        allow_reentry=True,
-    )
-    app.add_handler(conv)
-
-    # Fallback para texto suelto
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
-
-    # Tarea de limpieza de sesiones inactivas
-    app.job_queue.run_repeating(lambda *_: None, interval=3600, first=0)  # placeholder
-    asyncio.create_task(idle_cleaner(app))
-
-    app.run_polling(close_loop=False)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
 PY
 
-chmod +x "${PY_SCRIPT}"
+chmod +x "$APP_DIR/bot.py"
+chown -R sshbot:sshbot "$APP_DIR"
 
-#############################
-# SERVICIO SYSTEMD
-#############################
+# === .env ===
+# Generar ENCRYPTION_KEY (32 bytes base64 urlsafe)
+ENC_KEY=$(python3 - << 'PY'
+import os, base64
+print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+PY
+)
 
-tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<UNIT
+cat > "$APP_DIR/.env" << EOF
+TELEGRAM_TOKEN=$TELEGRAM_TOKEN
+ADMIN_USER_IDS=$ADMIN_IDS
+DATA_DIR=$APP_DIR
+KEYS_DIR=$KEYS_DIR
+TMP_DIR=$TMP_DIR
+ENCRYPTION_KEY=$ENC_KEY
+STRICT_HOST_KEY_CHECKING=$STRICT_HOST_KEY_CHECKING
+EOF
+
+chmod 600 "$APP_DIR/.env"
+chown sshbot:sshbot "$APP_DIR/.env"
+
+# === systemd unit ===
+cat > /etc/systemd/system/ssh-telegram-bot.service << 'UNIT'
 [Unit]
-Description=Telegram SSH Multi-Server Bot
+Description=SSH Telegram Bot (long polling)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=${BOT_USER}
-Group=${BOT_USER}
-WorkingDirectory=${BOT_HOME}
-EnvironmentFile=${ENV_FILE}
-ExecStart=${VENV_PATH}/bin/python ${PY_SCRIPT}
-Restart=on-failure
+Type=simple
+User=sshbot
+WorkingDirectory=/opt/ssh-tg-bot
+EnvironmentFile=/opt/ssh-tg-bot/.env
+ExecStart=/opt/ssh-tg-bot/.venv/bin/python /opt/ssh-tg-bot/bot.py
+Restart=always
 RestartSec=5s
+# Endurece el servicio (permitir escritura solo a /opt/ssh-tg-bot)
 NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ssh-tg-bot
 PrivateTmp=true
-ProtectSystem=full
 ProtectHome=true
-CapabilityBoundingSet=
-AmbientCapabilities=
-LockPersonality=true
-MemoryDenyWriteExecute=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-PrivateDevices=true
-RestrictSUIDSGID=true
-RestrictRealtime=true
-RestrictNamespaces=true
-SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}"
+systemctl enable --now ssh-telegram-bot
 sleep 1
-systemctl status "${SERVICE_NAME}" --no-pager || true
-
-##########################################
-# RESUMEN Y SIGUIENTES PASOS PARA TI
-##########################################
+systemctl --no-pager --full status ssh-telegram-bot || true
 
 echo
-echo "================= INSTALACIÓN/ACTUALIZACIÓN COMPLETA ================="
-echo "1) Agrega la clave pública del BOT en cada servidor destino (usuario remoto, ej. tgadmin):"
-echo "   ---- CLAVE PÚBLICA ----"
-echo "${PUBKEY_CONTENT}"
-echo "   -----------------------"
-echo "   Pasos en cada servidor destino:"
-echo "     sudo adduser --disabled-password --gecos \"\" tgadmin"
-echo "     sudo -u tgadmin mkdir -p /home/tgadmin/.ssh"
-echo "     echo \"${PUBKEY_CONTENT}\" | sudo tee -a /home/tgadmin/.ssh/authorized_keys >/dev/null"
-echo "     sudo chown -R tgadmin:tgadmin /home/tgadmin/.ssh"
-echo "     sudo chmod 700 /home/tgadmin/.ssh"
-echo "     sudo chmod 600 /home/tgadmin/.ssh/authorized_keys"
-echo "     # Endurece SSH (opcional y recomendado):"
-echo "     sudo sed -i 's/^#\\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config"
-echo "     sudo sed -i 's/^#\\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config"
-echo "     sudo systemctl reload ssh"
-echo
-if [[ "${STRICT_HOST_KEY}" == "true" ]]; then
-  echo "2) (STRICT_HOST_KEY=true) Registra las host keys en el bot:"
-  echo "   En Telegram: /trust <alias>  (usa ssh-keyscan y añade a known_hosts)"
-fi
-echo "2) Edita ${HOSTS_FILE} o usa /addhost o /menu para añadir alias/hosts."
-echo "   Luego, desde Telegram, usa /reload para recargar si editaste el archivo."
-echo
-echo "3) (Opcional) Sudo muy acotado en destino (ejemplo):"
-echo "     echo \"tgadmin ALL=(root) NOPASSWD: /usr/bin/systemctl reload nginx, /usr/bin/journalctl\" | sudo EDITOR='tee -a' visudo"
-echo
-echo "4) Ver logs del bot:   sudo journalctl -u ${SERVICE_NAME} -f"
-echo "5) Reiniciar el bot:   sudo systemctl restart ${SERVICE_NAME}"
-echo
-if [[ "${ALLOW_SHELL}" == "true" || "${ALLOW_CUSTOM}" == "true" ]]; then
-  echo "⚠️ Aviso: /custom y/o modo shell están ACTIVOS por defecto. Usa ALLOWED_USER_IDS correctamente."
-fi
-echo
-echo "Hecho. Abre Telegram y envía /start o /menu a tu bot."
+echo "============================================================"
+echo "✅ Instalación completada."
+echo "- Archivos en: /opt/ssh-tg-bot"
+echo "- Logs: journalctl -u ssh-telegram-bot -f"
+echo "- Comandos útiles:"
+echo "    sudo systemctl restart ssh-telegram-bot"
+echo "    sudo systemctl stop ssh-telegram-bot"
+echo "- Sube claves con: enviar *documento* a tu bot con caption: /uploadkey NOMBRE"
+echo "- Agrega servidor con: /addserver alias host 22 usuario key NOMBRE"
+echo "- Ejecuta comando: /sh alias 'uname -a'"
+echo "============================================================"
