@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# install_tg_ssh_bot.sh
+# install_tg_ssh_bot_envfirst.sh
 # Instala/actualiza un bot de Telegram para administrar varios servidores vía SSH (Ubuntu 24.04)
-# Crea/actualiza usuario de sistema, entorno Python, claves SSH, archivos, servicio systemd y arranca.
-# Esta versión habilita por defecto /custom y modo shell, y permite agregar hosts desde Telegram.
+# Habilita por defecto /custom y modo shell, y permite agregar hosts desde Telegram.
+# *** Esta variante CARGA un .env existente ANTES de verificar el token/IDs ***
 
 set -euo pipefail
 
@@ -10,9 +10,9 @@ set -euo pipefail
 # CONFIGURACIÓN RÁPIDA #
 ########################
 
-# 👉 EDITA ESTAS VARIABLES ANTES DE EJECUTAR (no compartas el token)
-TELEGRAM_BOT_TOKEN="8209886235:AAFEygF89KrKYGx06gqY0MKYGpyQXwU8kHY"     # BotFather token (obligatorio)
-ALLOWED_USER_IDS="1594636958"               # IDs de Telegram permitidos (coma-separados)
+# Valores por defecto (se pueden sobrescribir desde .env si ya existe)
+TELEGRAM_BOT_TOKEN="PON_AQUI_TU_TOKEN"     # BotFather token (obligatorio si no hay .env)
+ALLOWED_USER_IDS="123456789"               # IDs permitidos (coma-separados)
 BOT_USER="tg-bot"                          # usuario linux del bot
 BOT_HOME="/opt/tg-bot"
 HOSTS_FILE="${BOT_HOME}/hosts.yaml"
@@ -35,6 +35,19 @@ MAX_REPLY_CHARS="3500"
 STRICT_HOST_KEY="false"   # true = verifica host keys (recomendado), false = auto-acepta
 
 ###################################
+# CARGA .env ANTES DE VERIFICAR   #
+###################################
+
+# Si ya existe un despliegue anterior, intenta cargarlo para no exigir edición del script
+if [[ -f "${ENV_FILE}" ]]; then
+  echo "==> Cargando variables desde ${ENV_FILE}"
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
+fi
+
+###################################
 # VERIFICACIONES Y PREPARATIVOS   #
 ###################################
 
@@ -43,8 +56,9 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-if [[ -z "${TELEGRAM_BOT_TOKEN}" || "${TELEGRAM_BOT_TOKEN}" == "8209886235:AAFEygF89KrKYGx06gqY0MKYGpyQXwU8kHY" ]]; then
-  echo "❌ Debes configurar TELEGRAM_BOT_TOKEN al inicio del script." >&2
+# Validar token tras posible carga del .env
+if [[ -z "${TELEGRAM_BOT_TOKEN}" || "${TELEGRAM_BOT_TOKEN}" == "PON_AQUI_TU_TOKEN" ]]; then
+  echo "❌ Debes configurar TELEGRAM_BOT_TOKEN (en el script o en ${ENV_FILE})." >&2
   exit 1
 fi
 
