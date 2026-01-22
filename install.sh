@@ -11,8 +11,8 @@ set -euo pipefail
 ########################
 
 # 👉 EDITA ESTAS VARIABLES ANTES DE EJECUTAR (no compartas el token)
-TELEGRAM_BOT_TOKEN="PON_AQUI_TU_TOKEN"     # BotFather token (obligatorio)
-ALLOWED_USER_IDS="123456789"               # IDs de Telegram permitidos (coma-separados)
+TELEGRAM_BOT_TOKEN="8209886235:AAFEygF89KrKYGx06gqY0MKYGpyQXwU8kHY"     # BotFather token (obligatorio)
+ALLOWED_USER_IDS="1594636958"               # IDs de Telegram permitidos (coma-separados)
 BOT_USER="tg-bot"                          # usuario linux del bot
 BOT_HOME="/opt/tg-bot"
 HOSTS_FILE="${BOT_HOME}/hosts.yaml"
